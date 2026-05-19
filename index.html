@@ -6366,33 +6366,40 @@ function handleAction(act, el, ev) {
     case 'authOut':
       authSignOut(); return;
 
-    // DIAG: dump session state to alert (so user can read it on mobile)
     case 'authDiag': {
-      const stored = {};
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && (k.includes('sb-') || k.includes('nc-sb-'))) {
-          const v = localStorage.getItem(k);
-          stored[k] = v ? v.slice(0, 60) + '...' : '';
-        }
-      }
       const cfg = JSON.parse(localStorage.getItem('nc_supabase_cfg') || 'null');
       const lines = [
-        'CFG saved: ' + (cfg ? 'YES (' + cfg.url + ')' : 'NO'),
-        'Supabase ready: ' + _sbReady,
-        'S.user: ' + (S.user ? S.user.email : 'NULL'),
+        '=== NUTRICORE DIAG ===',
+        'Config URL: ' + (cfg?.url || CFG.supabase?.url || 'NON CONFIGURÉ'),
+        'Config Key: ' + (cfg?.anonKey ? cfg.anonKey.slice(0,20) + '...' : 'MANQUANTE'),
+        'Supabase SDK chargé: ' + (typeof window.supabase !== 'undefined' ? 'OUI' : 'NON'),
+        'Client prêt (_sbReady): ' + _sbReady,
+        'Utilisateur: ' + (S.user ? S.user.email + ' (id: ' + S.user.id.slice(0,8) + '...)' : 'NON CONNECTÉ'),
         'Cloud status: ' + S._cloudStatus,
-        'Cloud err: ' + (S._cloudErr || 'none'),
-        'LocalStorage auth keys: ' + Object.keys(stored).join(', '),
-        'Online: ' + navigator.onLine,
+        'Cloud err: ' + (S._cloudErr || 'aucune'),
+        'En ligne: ' + navigator.onLine,
+        'Sync en cours: ' + _syncInflight,
+        'STATE_VERSION: ' + S._v,
       ];
       if (_sbReady && _sb) {
         _sb.auth.getSession().then(({ data, error }) => {
-          lines.push('getSession() → ' + (data?.session ? 'session present, expires '+ new Date(data.session.expires_at*1000).toLocaleString() : 'NO session'));
-          if (error) lines.push('error: ' + error.message);
+          if (error) lines.push('getSession() erreur: ' + error.message);
+          else if (data?.session) {
+            const exp = new Date(data.session.expires_at * 1000);
+            lines.push('Session: ACTIVE jusqu\'au ' + exp.toLocaleString('fr-FR'));
+            lines.push('Token type: ' + (data.session.token_type || '?'));
+          } else {
+            lines.push('Session: AUCUNE (pas connecté)');
+          }
+          alert(lines.join('\n'));
+        }).catch(e => {
+          lines.push('getSession() exception: ' + e.message);
           alert(lines.join('\n'));
         });
       } else {
+        lines.push('');
+        lines.push('→ Le client Supabase n\'est pas initialisé.');
+        lines.push('  Vérifie que l\'URL et la clé sont correctes.');
         alert(lines.join('\n'));
       }
       return;
@@ -6891,83 +6898,87 @@ let _syncTimer = null;
 let _syncInflight = false;
 
 async function initCloud() {
-  // Try saved config from localStorage first (set via UI)
+  // Load config from localStorage if not in window.NUTRICORE_CONFIG
   if (!CFG.supabase || !CFG.supabase.url) {
     try {
       const saved = JSON.parse(localStorage.getItem('nc_supabase_cfg') || 'null');
-      if (saved && saved.url && saved.anonKey) {
-        CFG.supabase = saved;
-      }
+      if (saved && saved.url && saved.anonKey) CFG.supabase = saved;
     } catch (e) {}
   }
   if (!CFG.supabase || !CFG.supabase.url) {
-    S._cloudStatus = 'idle';
-    return;
+    S._cloudStatus = 'idle'; return;
   }
+
   try {
-    // Lazy-load Supabase client from CDN at runtime
+    // Step 1: Load Supabase SDK from CDN (with 8s timeout)
     if (!window.supabase) {
-      await new Promise((res, rej) => {
-        const s = document.createElement('script');
-        s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
-        s.onload = res;
-        s.onerror = rej;
-        document.head.appendChild(s);
-      });
+      await Promise.race([
+        new Promise((res, rej) => {
+          const s = document.createElement('script');
+          s.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js';
+          s.onload = res;
+          s.onerror = () => rej(new Error('CDN inaccessible — vérifie ta connexion'));
+          document.head.appendChild(s);
+        }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('CDN timeout (8s) — réseau lent ?')), 8000))
+      ]);
     }
+
+    // Step 2: Create Supabase client
     _sb = window.supabase.createClient(CFG.supabase.url, CFG.supabase.anonKey, {
       auth: {
         persistSession: true,
         autoRefreshToken: true,
         detectSessionInUrl: true,
         storage: window.localStorage,
-        storageKey: 'nc-sb-auth',          // explicit key, easier to debug
-        flowType: 'implicit'                // implicit flow: token comes directly in URL hash, works for magic links
+        storageKey: 'nc-sb-auth',
+        flowType: 'implicit'
       }
     });
     _sbReady = true;
 
-    // 1) Setup listener BEFORE getSession so we don't miss SIGNED_IN events
+    // Step 3: Auth state listener
     _sb.auth.onAuthStateChange(async (event, session) => {
-      console.log('[NC auth event]', event, session ? 'has session' : 'no session');
-      if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED') && session && session.user) {
+      console.log('[NC auth]', event, session?.user?.email || 'no user');
+      if ((event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED') && session?.user) {
         const wasNotConnected = !S.user;
         S.user = { id: session.user.id, email: session.user.email };
-        // Clean URL of the hash token left by Supabase magic link (only on actual SIGNED_IN)
-        if (event === 'SIGNED_IN' && (window.location.hash.includes('access_token') || window.location.search.includes('code='))) {
-          try { history.replaceState(null, '', window.location.pathname); } catch (e) {}
+        if (event === 'SIGNED_IN') {
+          try { history.replaceState(null, '', window.location.pathname); } catch (_) {}
         }
-        // Pull cloud data only if it's a fresh sign in (not silent refresh)
         if (wasNotConnected || event === 'SIGNED_IN') {
           await pullCloud();
-          if (S.sheet && S.sheet.type === 'auth') S.sheet = null;
+          if (S.sheet?.type === 'auth') S.sheet = null;
           render();
           if (event === 'SIGNED_IN') toast('CONNECTÉ ✓');
         }
         rerenderSyncStatus();
       } else if (event === 'SIGNED_OUT') {
-        S.user = null;
-        S._cloudStatus = 'idle';
-        render();
+        S.user = null; S._cloudStatus = 'idle'; render();
       }
     });
 
-    // 2) Force-restore session from storage. The Supabase client already does this
-    //    automatically on construction, but we want to wait for it deterministically.
-    const { data: { session }, error } = await _sb.auth.getSession();
-    if (error) {
-      console.error('getSession err', error);
-    } else if (session && session.user) {
-      // Already connected — set user immediately so UI doesn't flicker
+    // Step 4: Restore existing session (with 5s timeout)
+    const { data: { session }, error: sessionErr } = await Promise.race([
+      _sb.auth.getSession(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('getSession timeout (5s)')), 5000))
+    ]);
+
+    if (sessionErr) {
+      throw new Error('Session error: ' + sessionErr.message);
+    }
+    if (session?.user) {
       S.user = { id: session.user.id, email: session.user.email };
-      // Pull cloud data once on boot (the listener above won't fire INITIAL_SESSION on every page if session was already there)
       await pullCloud();
       render();
     }
     rerenderSyncStatus();
+
   } catch (e) {
-    console.error('Supabase init err', e);
-    S._cloudStatus = 'err'; S._cloudErr = String(e);
+    console.error('[NC] initCloud error:', e.message);
+    S._cloudStatus = 'err';
+    S._cloudErr = e.message || String(e);
+    _sbReady = false;
     rerenderSyncStatus();
   }
 }
@@ -7016,15 +7027,15 @@ async function syncCloud() {
   _syncInflight = true;
   S._cloudStatus = 'syncing'; rerenderSyncStatus();
 
-  // Safety timeout: if sync takes > 15s, mark as error and reset
+  // Safety timeout: if sync takes > 10s → error
   const safetyTimer = setTimeout(() => {
     if (_syncInflight) {
       _syncInflight = false;
       S._cloudStatus = 'err';
-      S._cloudErr = 'Timeout — réessaie dans quelques secondes';
+      S._cloudErr = 'Timeout 10s — vérifie ta connexion et tes tables Supabase';
       rerenderSyncStatus();
     }
-  }, 15000);
+  }, 10000);
 
   try {
     const userId = S.user.id;
